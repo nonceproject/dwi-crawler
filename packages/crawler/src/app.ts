@@ -1,7 +1,11 @@
 import axios from 'axios';
+import cheerio from 'cheerio';
 import lineReader from 'line-reader';
 import { logger } from 'jege/server';
 import Web3 from 'web3';
+
+import * as db from './dynamodb';
+import { Record } from './types';
 
 const log = logger('[crawler]');
 
@@ -23,15 +27,18 @@ const InterfaceId = {
 
 const web3 = new Web3(InfuraEndpoint.http);
 
+function removeMarkup(str: string) {
+  return str.replace(/(<([^>]+)>)/ig, '');
+}
+
 async function getTransactionRecords(resolver, record: Record) {
   const currentBlock = await web3.eth.getBlockNumber();
-  console.log('currentBlock: %s', currentBlock);
 
   const transactions = await resolver.getPastEvents('allEvents', {
     fromBlock: currentBlock - 1000, toBlock: 'latest' });
 
   const latestTransactions = transactions.slice(-5);
-  record.latestTransactions.push(...latestTransactions);
+  record.latestTransactions = latestTransactions;
 }
 
 async function getContentDocument(contentHash, record: Record) {
@@ -39,6 +46,19 @@ async function getContentDocument(contentHash, record: Record) {
   try {
     const { data } = await axios.get(url);
     const contentLinks = data.Links;
+
+    if (data.Data) {
+      let parsedData = data.Data;
+      if (/<\/?[a-z][\s\S]*>/i.test(data.Data)) {
+        try {
+          parsedData = removeMarkup(cheerio.load(data.Data)('body').text());
+        } catch (err) {
+          log('getContentDocument() html parsing error: %s', err);
+        }
+      }
+      record.contentDocument = parsedData;
+    }
+
     if (contentLinks) {
       record.contentLinks = data.Links;
       for (let i = 0; i < contentLinks.length; i += 1) {
@@ -46,7 +66,9 @@ async function getContentDocument(contentHash, record: Record) {
         if (link.Name === 'index.html') {
           const indexHtmlUrl = `${InfuraEndpoint.ipfs}/object/get?arg=${link.Hash}`;
           const { data: indexHtml } = await axios.get(indexHtmlUrl);
-          // console.log(22, indexHtml.Data);
+          const $ = cheerio.load(indexHtml.Data);
+          record.contentTitle = $('title').text();
+          record.contentDocument = $('body').text().substring(0, 1800);
           break;
         }
       }
@@ -59,43 +81,53 @@ async function getContentDocument(contentHash, record: Record) {
 async function getEns(name: string) {
   const ensName =`${name}.eth`;
 
-  const record: Record = {
-    addr: undefined,
-    contentDocument: undefined,
-    contentHash: undefined,
-    contentLinks: [],
-    contentTitle: undefined,
-    ensName,
-    latestTransactions: [],
-    resolverAddr: undefined,
-  };
-  const reecordDoesExist = await web3.eth.ens.recordExists(ensName);
-  if (reecordDoesExist) {
-    const resolver = await web3.eth.ens.getResolver(ensName);
-    if (resolver.options.address === ZERO) {
+  try {
+    const record: Record = {
+      addr: undefined,
+      contentDocument: undefined,
+      contentHash: undefined,
+      contentLinks: undefined,
+      contentTitle: undefined,
+      ensName,
+      latestTransactions: undefined,
+      resolverAddr: undefined,
+    };
+    const reecordDoesExist = await web3.eth.ens.recordExists(ensName);
+    if (reecordDoesExist) {
+      const resolver = await web3.eth.ens.getResolver(ensName);
+      if (resolver.options.address === ZERO) {
 
-    } else {
-      const hasAddr = await web3.eth.ens.supportsInterface(ensName, InterfaceId.addr);
-      if (hasAddr) {
-        const addr = await web3.eth.ens.getAddress(ensName);
-        record.addr = addr;
-        await getTransactionRecords(resolver, record);
-      }
+      } else {
+        record.resolverAddr = resolver.options.address;
+        try {
+          const hasAddr = await web3.eth.ens.supportsInterface(ensName, InterfaceId.addr);
+          if (hasAddr) {
+            const addr = await web3.eth.ens.getAddress(ensName);
+            record.addr = addr;
+            await getTransactionRecords(resolver, record);
+          }
+        } catch (err) {
+          log('getEns(): supportsInterface or getAddress failed, contractAddress: %s', resolver.options.address);
+          throw err;
+        }
 
-      const hasContentHash = await web3.eth.ens.supportsInterface(
-        ensName, InterfaceId.contentHash);
-      if (hasContentHash) {
-        const contentHash = await web3.eth.ens.getContenthash(ensName);
-        if (contentHash.decoded !== null) {
-          record.contentHash = contentHash.decoded;
+        const hasContentHash = await web3.eth.ens.supportsInterface(
+          ensName, InterfaceId.contentHash);
+        if (hasContentHash) {
+          const contentHash = await web3.eth.ens.getContenthash(ensName);
+          if (contentHash.decoded !== null) {
+            record.contentHash = contentHash.decoded;
 
-          await getContentDocument(contentHash.decoded, record);
+            await getContentDocument(contentHash.decoded, record);
+          }
         }
       }
     }
+    return record
+  } catch (err) {
+    log('getEns(): error retrieving ens data: %s', err);
+    throw err;
   }
-
-  log('getEns(): saving a record: %j', record);
 }
 
 function getNextLine(reader, cb) {
@@ -103,14 +135,16 @@ function getNextLine(reader, cb) {
     reader.nextLine(async function(err, line) {
       try {
         if (err) throw err;
-        await getEns(line);
-        getNextLine(reader, cb);
+        const record = await getEns(line);
+        await db.write(record);
       } catch (err) {
         log('main(): error reading next line: %o', err);
       }
+      getNextLine(reader, cb);
     });
   } else {
     log('getNextLine(): no line anymore');
+    cb();
   }
 }
 
@@ -126,18 +160,3 @@ async function main() {
 }
 
 export default main;
-
-interface Record {
-  addr?: string;
-  contentDocument?: string;
-  contentHash?: string;
-  contentLinks: {
-    Name: string;
-    Hash: string;
-    Size: number;
-  }[];
-  contentTitle?: string;
-  ensName: string;
-  latestTransactions: string[];
-  resolverAddr?: string;
-}

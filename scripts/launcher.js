@@ -11,7 +11,7 @@ const log = logger('[dwi-crawler]');
 
 const paths = {
   config: path.resolve(__dirname, '../config/config.json'),
-  keywords: path.resolve(__dirname, '../config/keywords.txt'),
+  keywords: path.resolve(__dirname, '../data/keywords.txt'),
 };
 
 const processDefinitions = {
